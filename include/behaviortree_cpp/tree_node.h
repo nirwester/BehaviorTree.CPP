@@ -20,6 +20,7 @@
 #include "behaviortree_cpp/utils/strcat.hpp"
 #include "behaviortree_cpp/utils/wakeup_signal.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <exception>
 #include <map>
@@ -463,6 +464,16 @@ protected:
   T parseString(const std::string& str) const;
 
 private:
+  // Only the root allocates this state. Keeping it in PImpl preserves node and
+  // Tree layouts, including when a Tree is moved.
+  struct TreeExecutionState
+  {
+    std::recursive_mutex mutex;
+    std::atomic<uint64_t> halt_generation{ 0 };
+    std::atomic_bool halting{ false };
+  };
+  TreeExecutionState& treeExecutionState();
+
   struct PImpl;
   std::unique_ptr<PImpl> _p;
 

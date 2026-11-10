@@ -675,6 +675,33 @@ void Tree::haltTree()
   {
     return;
   }
+  auto& execution = rootNode()->treeExecutionState();
+  // Coalesce concurrent/reentrant halts. In particular, a second halt must not
+  // wait for cleanup that may need the second caller to release a resource.
+  if(execution.halting.exchange(true))
+  {
+    return;
+  }
+  struct HaltGuard
+  {
+    std::atomic_bool& halting;
+    std::shared_ptr<WakeUpSignal> wake_up;
+    ~HaltGuard()
+    {
+      halting = false;
+      if(wake_up)
+      {
+        wake_up->emitSignal();
+      }
+    }
+  } guard{ execution.halting, {} };
+
+  // Publish cancellation before waiting for an in-flight tick. Otherwise the
+  // tick thread could acquire the mutex again and restart the halted tree.
+  ++execution.halt_generation;
+  const std::lock_guard<std::recursive_mutex> lock(execution.mutex);
+  guard.wake_up = wake_up_;
+
   // the halt should propagate to all the node if the nodes
   // have been implemented correctly
   rootNode()->haltNode();
@@ -684,12 +711,6 @@ void Tree::haltTree()
   BT::applyRecursiveVisitor(rootNode(), visitor);
 
   rootNode()->resetStatus();
-
-  // interrupt the sleep of tickWhileRunning(), if called from another thread
-  if(wake_up_)
-  {
-    wake_up_->emitSignal();
-  }
 }
 
 TreeNode* Tree::rootNode() const
@@ -775,36 +796,70 @@ NodeStatus Tree::tickRoot(TickOption opt, std::chrono::milliseconds sleep_time)
 {
   NodeStatus status = NodeStatus::IDLE;
 
-  if(!wake_up_)
-  {
-    initialize();
-  }
-
   if(rootNode() == nullptr)
   {
     throw RuntimeError("Empty Tree");
   }
 
-  // haltTree() resets the root to IDLE. If that happens (from another thread)
-  // while the last tick returned RUNNING, we must not tick again, because that
-  // would restart the tree (issue #686).
+  auto& execution = rootNode()->treeExecutionState();
+  std::unique_lock<std::recursive_mutex> execution_lock(execution.mutex);
+  if(execution.halting)
+  {
+    return NodeStatus::IDLE;
+  }
+  if(!wake_up_)
+  {
+    initialize();
+  }
+  const auto halt_generation = execution.halt_generation.load();
+  execution_lock.unlock();
+
+  // Cancellation remains visible even if an in-flight tick published RUNNING
+  // after a recursive halt, or a wake-up poll consumed the halt notification.
   const auto halted = [&]() {
-    return status == NodeStatus::RUNNING && rootNode()->status() == NodeStatus::IDLE;
+    return execution.halting || execution.halt_generation != halt_generation ||
+           (status == NodeStatus::RUNNING && rootNode()->status() == NodeStatus::IDLE);
+  };
+
+  const auto tick = [&]() {
+    const std::lock_guard<std::recursive_mutex> lock(execution.mutex);
+    if(halted())
+    {
+      return NodeStatus::IDLE;
+    }
+    const auto result = rootNode()->executeTick();
+    if(execution.halt_generation != halt_generation)
+    {
+      // A callback may have halted this tree recursively, before executeTick()
+      // published its result. Restore the halt after that tick has unwound.
+      if(!execution.halting)
+      {
+        haltTree();
+      }
+      return NodeStatus::IDLE;
+    }
+    return result;
   };
 
   while(status == NodeStatus::IDLE ||
         (opt == TickOption::WHILE_RUNNING && status == NodeStatus::RUNNING))
   {
-    status = rootNode()->executeTick();
+    status = tick();
 
     // Inner loop. The previous tick might have triggered the wake-up
     // in this case, unless TickOption::EXACTLY_ONCE, we tick again
     while(opt != TickOption::EXACTLY_ONCE && !halted() && status == NodeStatus::RUNNING &&
           wake_up_->waitFor(std::chrono::milliseconds(0)))
     {
-      status = rootNode()->executeTick();
+      status = tick();
     }
 
+    // A zero-duration wake-up poll may have consumed the halt notification.
+    // Check cancellation before sleeping, even if no further tick was needed.
+    if(halted())
+    {
+      return NodeStatus::IDLE;
+    }
     if(isStatusCompleted(status))
     {
       rootNode()->resetStatus();

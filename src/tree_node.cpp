@@ -47,6 +47,8 @@ struct TreeNode::PImpl
 
   std::mutex callback_injection_mutex;
 
+  std::unique_ptr<TreeExecutionState> tree_execution_state;
+
   std::shared_ptr<WakeUpSignal> wake_up;
 
   std::array<ScriptFunction, size_t(PreCond::COUNT_)> pre_parsed;
@@ -67,6 +69,16 @@ TreeNode& TreeNode::operator=(TreeNode&& other) noexcept
 }
 
 TreeNode::~TreeNode() = default;
+
+TreeNode::TreeExecutionState& TreeNode::treeExecutionState()
+{
+  const std::lock_guard<std::mutex> lock(_p->state_mutex);
+  if(!_p->tree_execution_state)
+  {
+    _p->tree_execution_state = std::make_unique<TreeExecutionState>();
+  }
+  return *_p->tree_execution_state;
+}
 
 NodeStatus TreeNode::executeTick()
 {

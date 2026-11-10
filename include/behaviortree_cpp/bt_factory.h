@@ -122,6 +122,9 @@ public:
 
   void initialize();
 
+  /// Halt the tree, waiting for an in-flight tick to finish. Tick callbacks must
+  /// not wait for another thread's haltTree() call to return. Concurrent halt
+  /// requests are coalesced while the first caller performs cleanup.
   void haltTree();
 
   [[nodiscard]] TreeNode* rootNode() const;

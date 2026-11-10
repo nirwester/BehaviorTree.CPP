@@ -122,3 +122,80 @@ TEST(WakeUp, HaltTreeStopsTickWhileRunning_Issue686)
   ASSERT_EQ(result.get(), NodeStatus::IDLE);
   ASSERT_EQ(starts, 1);
 }
+
+// The first tick can still be inside onStart() when the other thread observes
+// startup. Halting must wait for that tick rather than have its IDLE status
+// overwritten by the tick's eventual RUNNING result.
+TEST(WakeUp, HaltWaitsForInFlightTick)
+{
+  using namespace std::chrono_literals;
+  for(const bool first_tick : { true, false })
+  {
+    SCOPED_TRACE(first_tick ? "initial tick" : "running tick");
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto release_future = release.get_future();
+    std::atomic<int> ticks{ 0 };
+    std::atomic_bool stop{ false };
+    BehaviorTreeFactory factory;
+    factory.registerSimpleCondition("BlockingTick", [&](TreeNode&) {
+      const int tick = ++ticks;
+      if(tick == (first_tick ? 1 : 2))
+      {
+        entered.set_value();
+        release_future.wait();
+      }
+      return stop ? NodeStatus::SUCCESS : NodeStatus::RUNNING;
+    });
+    auto tree = factory.createTreeFromText(R"(
+      <root BTCPP_format="4"><BehaviorTree><BlockingTick/></BehaviorTree></root>)");
+    if(!first_tick)
+    {
+      EXPECT_EQ(tree.tickExactlyOnce(), NodeStatus::RUNNING);
+    }
+    auto ticking =
+        std::async(std::launch::async, [&] { return tree.tickWhileRunning(10s); });
+    entered.get_future().wait();
+    std::promise<void> halt_started;
+    auto halting = std::async(std::launch::async, [&] {
+      halt_started.set_value();
+      tree.haltTree();
+    });
+    halt_started.get_future().wait();
+    EXPECT_EQ(halting.wait_for(50ms), std::future_status::timeout);
+    release.set_value();
+    halting.get();
+
+    const bool returned = ticking.wait_for(2s) == std::future_status::ready;
+    stop = true;
+    tree.emitWakeUpSignal();
+    EXPECT_TRUE(returned);
+    EXPECT_EQ(ticking.get(), NodeStatus::IDLE);
+    EXPECT_EQ(tree.rootNode()->status(), NodeStatus::IDLE);
+    EXPECT_EQ(ticks, first_tick ? 1 : 2);
+  }
+}
+
+TEST(WakeUp, HaltFromTickCallbackDoesNotRestartTree)
+{
+  BehaviorTreeFactory factory;
+  Tree* current_tree = nullptr;
+  int ticks = 0;
+  factory.registerSimpleCondition("HaltDuringTick", [&](TreeNode&) {
+    if(++ticks == 1)
+    {
+      current_tree->haltTree();
+      return NodeStatus::RUNNING;
+    }
+    return NodeStatus::SUCCESS;
+  });
+  auto tree = factory.createTreeFromText(R"(
+    <root BTCPP_format="4"><BehaviorTree><HaltDuringTick/></BehaviorTree></root>)");
+  current_tree = &tree;
+  EXPECT_EQ(tree.tickWhileRunning(), NodeStatus::IDLE);
+  EXPECT_EQ(tree.rootNode()->status(), NodeStatus::IDLE);
+  EXPECT_EQ(ticks, 1);
+  // A later explicit tick starts a new execution, independent of the old halt.
+  EXPECT_EQ(tree.tickOnce(), NodeStatus::SUCCESS);
+  EXPECT_EQ(ticks, 2);
+}

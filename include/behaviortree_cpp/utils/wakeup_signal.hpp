@@ -24,7 +24,12 @@ public:
 
   void emitSignal()
   {
-    ready_ = true;
+    {
+      // Use the waiter's mutex so notification cannot fall between its predicate
+      // check and entering the wait.
+      const std::lock_guard<std::mutex> lock(mutex_);
+      ready_ = true;
+    }
     cv_.notify_all();
   }
 
